@@ -429,9 +429,266 @@ def transcode_hls_progressive(job: ProgressiveHlsJob):
     }
 
 
+
+UI_HTML = r"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Colab OneDrive HLS Transcoder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #111827; color: #e5e7eb; }
+    header { padding: 18px 22px; background: #030712; border-bottom: 1px solid #374151; }
+    h1 { margin: 0; font-size: 22px; }
+    main { padding: 18px; max-width: 1200px; margin: auto; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { background: #1f2937; border: 1px solid #374151; border-radius: 14px; padding: 16px; }
+    label { display: block; margin: 10px 0 5px; font-size: 13px; color: #cbd5e1; }
+    input, select, button, textarea {
+      width: 100%; box-sizing: border-box; padding: 10px; border-radius: 10px;
+      border: 1px solid #4b5563; background: #111827; color: #f9fafb;
+    }
+    button { cursor: pointer; background: #2563eb; border: 0; font-weight: bold; margin-top: 10px; }
+    button.secondary { background: #374151; }
+    button.danger { background: #b91c1c; }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+    .files { max-height: 340px; overflow: auto; border: 1px solid #374151; border-radius: 10px; margin-top: 10px; }
+    .item { padding: 9px 10px; border-bottom: 1px solid #374151; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+    .item:hover { background: #374151; }
+    .folder { color: #93c5fd; }
+    .file { color: #d1fae5; }
+    .muted { color: #9ca3af; font-size: 13px; }
+    pre { background: #030712; padding: 12px; border-radius: 12px; overflow: auto; max-height: 330px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Colab OneDrive HLS Transcoder</h1>
+  <div class="muted">OneDrive source / URL source → Colab FFmpeg GPU → HLS upload to OneDrive.</div>
+</header>
+<main>
+  <div class="grid">
+    <section class="card">
+      <h2>1. OneDrive Browser</h2>
+      <div class="row">
+        <div>
+          <label>Current OneDrive path</label>
+          <input id="browsePath" value="/" />
+        </div>
+        <div style="flex:0.35">
+          <label>&nbsp;</label>
+          <button onclick="listOneDrive()">Open</button>
+        </div>
+      </div>
+      <div class="row">
+        <button class="secondary" onclick="goUp()">Up</button>
+        <button class="secondary" onclick="listOneDrive()">Refresh</button>
+      </div>
+      <div id="fileList" class="files"></div>
+      <label>Selected OneDrive video path</label>
+      <input id="selectedPath" placeholder="/Raw/movie.mp4" />
+      <label>Output HLS folder</label>
+      <input id="outputFolder1" placeholder="/HLS/movie-name" />
+      <button onclick="makeHlsFromOneDrive()">Make HLS from selected OneDrive file</button>
+    </section>
+
+    <section class="card">
+      <h2>2. Stream URL → HLS</h2>
+      <label>Direct video / stream URL</label>
+      <textarea id="downloadUrl" rows="4" placeholder="https://example.com/video.mp4"></textarea>
+      <label>Output HLS folder</label>
+      <input id="outputFolder2" placeholder="/HLS/url-video-name" />
+      <button onclick="makeHlsFromUrl()">Make HLS from URL</button>
+      <h3>Target</h3>
+      <label>Upload target</label>
+      <select id="target">
+        <option value="onedrive">OneDrive</option>
+        <option value="nginx" disabled>Nginx backend later</option>
+      </select>
+      <div class="muted">Nginx target can be added later when your PC backend upload API is ready.</div>
+    </section>
+  </div>
+
+  <section class="card" style="margin-top:16px">
+    <h2>3. Transcode Settings</h2>
+    <div class="grid">
+      <div><label>Job ID</label><input id="jobId" placeholder="movie_job_001" /></div>
+      <div><label>Video bitrate</label><input id="videoBitrate" value="2500k" /></div>
+      <div><label>Audio bitrate</label><input id="audioBitrate" value="128k" /></div>
+      <div><label>HLS segment seconds</label><input id="hlsTime" value="10" /></div>
+      <div><label>Upload poll seconds</label><input id="uploadPollSec" value="2" /></div>
+      <div><label>pre_master upload interval seconds</label><input id="preMasterSec" value="8" /></div>
+    </div>
+    <label><input type="checkbox" id="deleteOriginal" style="width:auto"> Delete original OneDrive source after success</label>
+  </section>
+
+  <section class="card" style="margin-top:16px">
+    <h2>4. Status / Log</h2>
+    <div class="row">
+      <button class="secondary" onclick="health()">Health</button>
+      <button class="secondary" onclick="debugEnv()">Debug Env</button>
+      <button class="danger" onclick="clearLog()">Clear</button>
+    </div>
+    <pre id="log">Ready.</pre>
+  </section>
+</main>
+<script>
+function log(obj) {
+  const el = document.getElementById('log');
+  const text = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+  el.textContent = text + "\n\n" + el.textContent;
+}
+function clearLog() { document.getElementById('log').textContent = ''; }
+function safeNameFromPath(path) {
+  let name = (path || 'job').split('/').filter(Boolean).pop() || 'job';
+  return name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]+/g, '_');
+}
+function buildPayload(sourceType) {
+  const selected = document.getElementById('selectedPath').value.trim();
+  const url = document.getElementById('downloadUrl').value.trim();
+  const output1 = document.getElementById('outputFolder1').value.trim();
+  const output2 = document.getElementById('outputFolder2').value.trim();
+  let base = sourceType === 'onedrive' ? safeNameFromPath(selected) : 'url_job_' + Date.now();
+  let jobId = document.getElementById('jobId').value.trim() || base + '_prog';
+  const payload = {
+    job_id: jobId,
+    output_onedrive_folder: sourceType === 'onedrive' ? output1 : output2,
+    delete_original_after_success: document.getElementById('deleteOriginal').checked,
+    video_bitrate: document.getElementById('videoBitrate').value.trim() || '2500k',
+    audio_bitrate: document.getElementById('audioBitrate').value.trim() || '128k',
+    hls_time: Number(document.getElementById('hlsTime').value || 10),
+    upload_poll_sec: Number(document.getElementById('uploadPollSec').value || 2),
+    pre_master_upload_every_sec: Number(document.getElementById('preMasterSec').value || 8)
+  };
+  if (sourceType === 'onedrive') payload.source_path = selected;
+  if (sourceType === 'url') payload.download_url = url;
+  return payload;
+}
+async function api(path, options={}) {
+  const res = await fetch(path, options);
+  const txt = await res.text();
+  let data;
+  try { data = JSON.parse(txt); } catch { data = txt; }
+  if (!res.ok) throw data;
+  return data;
+}
+async function health() { try { log(await api('/health')); } catch(e) { log(e); } }
+async function debugEnv() { try { log(await api('/debug-env')); } catch(e) { log(e); } }
+async function listOneDrive() {
+  const path = document.getElementById('browsePath').value || '/';
+  const box = document.getElementById('fileList');
+  box.innerHTML = '<div class="item muted">Loading...</div>';
+  try {
+    const data = await api('/api/onedrive/list?path=' + encodeURIComponent(path));
+    box.innerHTML = '';
+    (data.items || []).forEach(item => {
+      const div = document.createElement('div');
+      div.className = 'item ' + (item.type === 'folder' ? 'folder' : 'file');
+      div.innerHTML = `<span>${item.type === 'folder' ? '📁' : '🎬'} ${item.name}</span><span class="muted">${item.size_mb || ''}</span>`;
+      div.onclick = () => {
+        if (item.type === 'folder') {
+          document.getElementById('browsePath').value = item.path;
+          listOneDrive();
+        } else {
+          document.getElementById('selectedPath').value = item.path;
+          const base = safeNameFromPath(item.path);
+          document.getElementById('outputFolder1').value = '/HLS/' + base;
+          document.getElementById('jobId').value = base + '_prog';
+        }
+      };
+      box.appendChild(div);
+    });
+    log({ listed: path, count: (data.items || []).length });
+  } catch(e) {
+    box.innerHTML = '<div class="item">Failed to list OneDrive</div>';
+    log(e);
+  }
+}
+function goUp() {
+  let p = document.getElementById('browsePath').value || '/';
+  p = p.replace(/\/+$/, '');
+  const parts = p.split('/').filter(Boolean);
+  parts.pop();
+  document.getElementById('browsePath').value = '/' + parts.join('/');
+  if (document.getElementById('browsePath').value === '') document.getElementById('browsePath').value = '/';
+  listOneDrive();
+}
+async function makeHlsFromOneDrive() {
+  const payload = buildPayload('onedrive');
+  if (!payload.source_path || !payload.output_onedrive_folder) { log('source_path and output folder are required.'); return; }
+  log({ start: 'OneDrive progressive HLS job', payload });
+  try {
+    const data = await api('/job/transcode-hls-progressive', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    log(data);
+  } catch(e) { log(e); }
+}
+async function makeHlsFromUrl() {
+  const payload = buildPayload('url');
+  if (!payload.download_url || !payload.output_onedrive_folder) { log('download_url and output folder are required.'); return; }
+  log({ start: 'URL progressive HLS job', payload });
+  try {
+    const data = await api('/job/transcode-hls-progressive', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    log(data);
+  } catch(e) { log(e); }
+}
+health();
+listOneDrive();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/api/onedrive/list")
+def api_onedrive_list(path: str = "/"):
+    token = get_access_token()
+    path = normalize_path(path)
+    if path == "/":
+        url = f"{GRAPH_BASE}/me/drive/root/children"
+    else:
+        encoded = graph_path(path)
+        url = f"{GRAPH_BASE}/me/drive/root:{encoded}:/children"
+
+    r = requests.get(url, headers=graph_headers(token), timeout=60)
+    if not r.ok:
+        raise HTTPException(status_code=500, detail=f"OneDrive list failed: {r.status_code} {r.text[:500]}")
+
+    items = []
+    for item in r.json().get("value", []):
+        is_folder = "folder" in item
+        name = item.get("name", "")
+        child_path = normalize_path(path).rstrip("/") + "/" + name if path != "/" else "/" + name
+        size = item.get("size", 0) or 0
+        items.append({
+            "name": name,
+            "path": child_path,
+            "type": "folder" if is_folder else "file",
+            "size": size,
+            "size_mb": "" if is_folder else round(size / 1024 / 1024, 2),
+        })
+
+    items.sort(key=lambda x: (x["type"] != "folder", x["name"].lower()))
+    return {"ok": True, "path": path, "items": items}
+
+
+@app.post("/api/onedrive/create-folder")
+def api_create_onedrive_folder(payload: dict):
+    token = get_access_token()
+    folder = payload.get("path", "")
+    if not folder:
+        raise HTTPException(status_code=400, detail="path required")
+    ensure_onedrive_folder(token, folder)
+    return {"ok": True, "path": normalize_path(folder)}
+
+
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Colab OneDrive HLS Worker", "port": APP_PORT, "endpoints": ["/health", "/debug-env", "/job/download-upload-test", "/job/transcode-hls"]}
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(UI_HTML)
+
 
 @app.get("/health")
 def health():

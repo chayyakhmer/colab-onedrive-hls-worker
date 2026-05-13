@@ -1,90 +1,115 @@
-# Colab OneDrive HLS Worker
+# Colab OneDrive HLS Worker UI
 
-Flow:
+## Features
 
 ```text
-OneDrive raw video
-→ Colab full download
-→ FFmpeg GPU/CPU transcode to HLS
-→ upload HLS folder back to OneDrive
+1. Browse OneDrive files/folders and click Make HLS
+2. Paste stream/video URL and click Make HLS
+3. Select output OneDrive folder path
+4. Progressive HLS:
+   pre_master.m3u8 while running
+   master.m3u8 after finished
+5. Nginx target placeholder for later PC backend upload
 ```
 
-Worker port: `2323`
+## Push/update to GitHub
 
-## Required env
+Use `push_to_github.bat` from this bundle, or manually copy these files into your repo:
 
-```env
-MS_CLIENT_ID=your_full_client_id
-MS_CLIENT_SECRET=your_client_secret
-MS_TENANT=consumers
-MS_REFRESH_TOKEN=your_refresh_token
-PORT=2323
+```text
+colab_worker.py
+requirements.txt
+README.md
+colab_quickstart.py
 ```
 
-## Colab start
+Repo:
+
+```text
+https://github.com/chayyakhmer/colab-onedrive-hls-worker.git
+```
+
+## Colab Cell 1 — setup + run all in background
+
+Replace secrets before running.
 
 ```python
-!git clone https://github.com/YOUR_USERNAME/colab-onedrive-hls-worker.git
+!rm -rf colab-onedrive-hls-worker
+!git clone https://github.com/chayyakhmer/colab-onedrive-hls-worker.git
 %cd colab-onedrive-hls-worker
-!pip install -r requirements.txt
-!apt-get update -y && apt-get install -y ffmpeg
+
+!pip install -q -r requirements.txt
+!apt-get update -y > /dev/null
+!apt-get install -y ffmpeg > /dev/null
 
 import os
-os.environ["MS_CLIENT_ID"] = "..."
-os.environ["MS_CLIENT_SECRET"] = "..."
+
+os.environ["MS_CLIENT_ID"] = "YOUR_FULL_CLIENT_ID"
+os.environ["MS_CLIENT_SECRET"] = "YOUR_CLIENT_SECRET"
 os.environ["MS_TENANT"] = "consumers"
-os.environ["MS_REFRESH_TOKEN"] = "..."
+os.environ["MS_REFRESH_TOKEN"] = "YOUR_REFRESH_TOKEN"
 os.environ["PORT"] = "2323"
 
-!python colab_worker.py
+!nvidia-smi || true
+
+!pkill -f colab_worker || true
+!pkill -f cloudflared || true
+
+!nohup python colab_worker.py > worker.log 2>&1 &
+
+!wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+!chmod +x cloudflared
+
+!nohup ./cloudflared tunnel --no-autoupdate run --token "YOUR_CLOUDFLARE_TUNNEL_TOKEN" > cloudflared.log 2>&1 &
+
+!sleep 8
+
+print("===== LOCAL HEALTH =====")
+!curl -s http://127.0.0.1:2323/health || true
+
+print("\n===== DEBUG ENV =====")
+!curl -s http://127.0.0.1:2323/debug-env || true
+
+print("\n===== WORKER LOG =====")
+!tail -n 30 worker.log
+
+print("\n===== CLOUDFLARED LOG =====")
+!tail -n 50 cloudflared.log
 ```
 
-## Test download + upload only
+## Colab Cell 2 — test/logs
 
-```bash
-curl -X POST http://127.0.0.1:2323/job/download-upload-test \
-  -H "Content-Type: application/json" \
-  -d '{
-    "job_id": "test1",
-    "source_path": "/Raw/movieA.mp4",
-    "output_onedrive_folder": "/UploadTest"
-  }'
+```python
+print("===== LOCAL HEALTH =====")
+!curl -s http://127.0.0.1:2323/health
+
+print("\n===== PUBLIC HEALTH =====")
+!curl -s https://transcode.labhome.xyz/health || true
+
+print("\n===== LOGS =====")
+!tail -n 80 worker.log
+!tail -n 50 cloudflared.log
 ```
 
-## Transcode to HLS
-
-```bash
-curl -X POST http://127.0.0.1:2323/job/transcode-hls \
-  -H "Content-Type: application/json" \
-  -d '{
-    "job_id": "movieA",
-    "source_path": "/Raw/movieA.mp4",
-    "output_onedrive_folder": "/HLS/movieA",
-    "delete_original_after_success": false,
-    "video_bitrate": "2500k",
-    "audio_bitrate": "128k",
-    "hls_time": 6
-  }'
-```
-
-Output in OneDrive:
+## Open frontend
 
 ```text
-/HLS/movieA/master.m3u8
-/HLS/movieA/seg_00000.ts
-/HLS/movieA/seg_00001.ts
+https://transcode.labhome.xyz
 ```
 
-## Cloudflare Tunnel later
+## Windows DNS workaround
 
-Quick random tunnel:
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:2323
+```bat
+curl -v --resolve transcode.labhome.xyz:443:104.21.17.142 https://transcode.labhome.xyz/health
 ```
 
-For fixed domain `https://trancode.labhome.xyz`, create a named Cloudflare Tunnel in Cloudflare dashboard and route it to:
+## API endpoints
 
 ```text
-http://127.0.0.1:2323
+GET  /
+GET  /api/onedrive/list?path=/
+POST /api/onedrive/create-folder
+POST /job/transcode-hls-progressive
+GET  /health
+GET  /debug-env
 ```
