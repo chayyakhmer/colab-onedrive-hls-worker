@@ -95,3 +95,28 @@ os.environ["PORT"] = "2323"
 ## Notes
 
 For unfinished jobs, `pre_master.m3u8` is uploaded progressively. `master.m3u8` is uploaded only after FFmpeg completes successfully.
+
+
+## Update: aria2 URL downloader
+
+This version uses `aria2c` for Stream URL downloads when available.
+
+Benefits:
+- Resume partial downloads with `-c`
+- Multi-connection download with `-x 8 -s 8`
+- Better retry behavior for large signed URLs
+- Python requests fallback remains available
+
+In Colab install block, include:
+
+```python
+!apt-get install -y ffmpeg aria2 > /dev/null
+```
+
+Optional environment tuning:
+
+```python
+os.environ["ARIA2_CONNECTIONS"] = "8"
+os.environ["ARIA2_SPLITS"] = "8"
+os.environ["ARIA2_CHUNK_SIZE"] = "1M"
+```

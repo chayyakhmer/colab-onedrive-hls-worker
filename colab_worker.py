@@ -1,3 +1,6 @@
+import subprocess
+import time
+import shutil
 import os, time, shutil, subprocess, threading, traceback
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -141,20 +144,120 @@ def download_url_to_file(url: str, dest: Path, headers: Optional[dict] = None) -
 def download_from_url(url: str, dest: Path) -> int:
     """
     Download a direct video/stream URL into Colab local disk.
-    Used by Stream URL -> HLS feature.
+
+    Priority:
+    1) aria2c multi-connection downloader with resume support
+    2) Python requests fallback with resume/retry support
+
+    This is better for large signed URLs because browser-like single requests
+    can stall on datacenter IPs.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    total = 0
-    headers = {"User-Agent": "Mozilla/5.0 Colab-HLS-Worker"}
-    with requests.get(url, headers=headers, stream=True, timeout=120) as r:
-        if not r.ok:
-            raise HTTPException(status_code=500, detail=f"URL download failed: {r.status_code} {r.text[:500]}")
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    total += len(chunk)
-    return total
+
+    # ---- Preferred: aria2c if installed ----
+    aria2 = shutil.which("aria2c")
+    if aria2:
+        cmd = [
+            aria2,
+            "-c",                         # continue partial download
+            "-x", os.getenv("ARIA2_CONNECTIONS", "8"),
+            "-s", os.getenv("ARIA2_SPLITS", "8"),
+            "-k", os.getenv("ARIA2_CHUNK_SIZE", "1M"),
+            "--file-allocation=none",
+            "--allow-overwrite=true",
+            "--auto-file-renaming=false",
+            "--summary-interval=10",
+            "--console-log-level=notice",
+            "--max-tries=0",              # unlimited tries
+            "--retry-wait=5",
+            "--timeout=60",
+            "--connect-timeout=30",
+            "--lowest-speed-limit=50K",   # force retry when stuck
+            "--user-agent=Mozilla/5.0 Colab-HLS-Worker",
+            "-d", str(dest.parent),
+            "-o", dest.name,
+            url,
+        ]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        output_tail = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                print("[aria2c]", line, flush=True)
+                output_tail.append(line)
+                output_tail = output_tail[-30:]
+
+        rc = proc.wait()
+        if rc == 0 and dest.exists() and dest.stat().st_size > 0:
+            return dest.stat().st_size
+
+        # aria2 sometimes fails on hosts that dislike multi-range requests.
+        # Fall back to requests below.
+        print("[download] aria2c failed; falling back to Python requests.", flush=True)
+        if output_tail:
+            print("\n".join(output_tail[-10:]), flush=True)
+
+    # ---- Fallback: Python requests with resume/retry ----
+    total = dest.stat().st_size if dest.exists() else 0
+    max_retries = int(os.getenv("URL_DOWNLOAD_RETRIES", "20"))
+    idle_timeout_sec = int(os.getenv("URL_DOWNLOAD_IDLE_TIMEOUT", "90"))
+
+    headers_base = {
+        "User-Agent": "Mozilla/5.0 Colab-HLS-Worker",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
+
+    for attempt in range(1, max_retries + 1):
+        headers = dict(headers_base)
+        if dest.exists() and dest.stat().st_size > 0:
+            headers["Range"] = f"bytes={dest.stat().st_size}-"
+
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=(30, 60)) as r:
+                # 416 usually means local file already complete for range request
+                if r.status_code == 416 and dest.exists() and dest.stat().st_size > 0:
+                    return dest.stat().st_size
+
+                if r.status_code not in (200, 206):
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"URL download failed: {r.status_code} {r.text[:500]}"
+                    )
+
+                mode = "ab" if r.status_code == 206 and dest.exists() else "wb"
+                if mode == "wb":
+                    total = 0
+
+                last_progress = time.time()
+                with open(dest, mode) as f:
+                    for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            total += len(chunk)
+                            last_progress = time.time()
+                        elif time.time() - last_progress > idle_timeout_sec:
+                            raise TimeoutError("URL download stalled with no progress")
+
+                if dest.exists() and dest.stat().st_size > 0:
+                    return dest.stat().st_size
+
+        except Exception as e:
+            print(f"[download] attempt {attempt}/{max_retries} failed: {e}", flush=True)
+            if attempt >= max_retries:
+                raise
+            time.sleep(min(5 * attempt, 60))
+
+    return dest.stat().st_size if dest.exists() else 0
 
 def download_from_onedrive_path(token: str, source_path: str, dest: Path) -> int:
     url = f"{GRAPH_BASE}/me/drive/root:{graph_path(source_path)}:/content"
