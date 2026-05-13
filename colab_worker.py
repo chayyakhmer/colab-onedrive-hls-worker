@@ -318,17 +318,28 @@ def upload_file(token: str, local_file: Path, onedrive_path: str):
         upload_large_file(token, local_file, onedrive_path)
 
 def upload_folder_to_onedrive(token: str, local_folder: Path, remote_folder: str) -> List[str]:
-    ensure_onedrive_folder(token, remote_folder)
-    uploaded = []
-    for file in sorted(local_folder.rglob("*")):
-        if not file.is_file():
-            continue
-        rel = file.relative_to(local_folder).as_posix()
-        remote_path = normalize_path(remote_folder).rstrip("/") + "/" + rel
-        parent = "/" + "/".join(remote_path.strip("/").split("/")[:-1])
-        ensure_onedrive_folder(token, parent)
-        upload_file(token, file, remote_path)
+    """
+    Upload a whole local folder to OneDrive with visible progress.
+
+    This is important for HLS because one movie can have hundreds of .ts files.
+    """
+    uploaded: List[str] = []
+    local_folder = Path(local_folder)
+    files = sorted([p for p in local_folder.iterdir() if p.is_file()])
+
+    total = len(files)
+    print(f"[upload] Files to upload: {total}", flush=True)
+
+    for idx, file_path in enumerate(files, start=1):
+        remote_path = remote_folder.rstrip("/") + "/" + file_path.name
+        upload_file(token, file_path, remote_path)
         uploaded.append(remote_path)
+
+        if idx == 1 or idx % 10 == 0 or idx == total or file_path.name.endswith(".m3u8"):
+            size_mb = file_path.stat().st_size / 1024 / 1024
+            print(f"[upload] Uploaded {idx}/{total}: {file_path.name} ({size_mb:.2f} MB)", flush=True)
+
+    print(f"[upload] DONE uploaded {len(uploaded)}/{total} files to {remote_folder}", flush=True)
     return uploaded
 
 def has_nvidia_gpu() -> bool:
@@ -1091,3 +1102,78 @@ def transcode_hls(job: HlsJob):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
+
+
+# ============================================================
+# Manual recovery / bugfix endpoints
+# ============================================================
+
+class LocalUploadJob(BaseModel):
+    job_id: str
+    output_onedrive_folder: str
+
+
+@app.post("/job/upload-existing-hls")
+def upload_existing_hls(job: LocalUploadJob):
+    """
+    Upload an already-created local HLS output folder to OneDrive.
+
+    Useful when:
+    - source download completed manually
+    - ffmpeg was run manually
+    - upload was interrupted and needs to be run again
+    """
+    local_dir = Path(f"/content/transcode_jobs/output/{job.job_id}")
+
+    if not local_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Local HLS folder not found: {local_dir}")
+
+    master = local_dir / "master.m3u8"
+    if not master.exists():
+        raise HTTPException(status_code=400, detail=f"master.m3u8 not found in: {local_dir}")
+
+    token = get_access_token()
+    uploaded = upload_folder_to_onedrive(token, local_dir, job.output_onedrive_folder)
+
+    return {
+        "ok": True,
+        "job_id": job.job_id,
+        "uploaded_files": len(uploaded),
+        "output_onedrive_folder": job.output_onedrive_folder,
+        "master_m3u8": job.output_onedrive_folder.rstrip("/") + "/master.m3u8",
+    }
+
+
+@app.get("/job/local-files/{job_id}")
+def local_files_status(job_id: str):
+    """
+    Check local input/output state for a job.
+    """
+    input_dir = Path(f"/content/transcode_jobs/input/{job_id}")
+    output_dir = Path(f"/content/transcode_jobs/output/{job_id}")
+    source = input_dir / "source.mp4"
+    aria2_meta = input_dir / "source.mp4.aria2"
+    master = output_dir / "master.m3u8"
+
+    segs = sorted(output_dir.glob("seg_*.ts")) if output_dir.exists() else []
+    output_size = sum(p.stat().st_size for p in output_dir.glob("*") if p.is_file()) if output_dir.exists() else 0
+
+    endlist = False
+    if master.exists():
+        try:
+            endlist = "#EXT-X-ENDLIST" in master.read_text(errors="ignore")[-500:]
+        except Exception:
+            endlist = False
+
+    return {
+        "job_id": job_id,
+        "input_exists": source.exists(),
+        "input_gb": round(source.stat().st_size / 1024 / 1024 / 1024, 3) if source.exists() else 0,
+        "aria2_resume_exists": aria2_meta.exists(),
+        "output_exists": output_dir.exists(),
+        "output_gb": round(output_size / 1024 / 1024 / 1024, 3),
+        "segments_created": len(segs),
+        "last_segment": segs[-1].name if segs else None,
+        "master_exists": master.exists(),
+        "master_has_endlist": endlist,
+    }

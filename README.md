@@ -120,3 +120,34 @@ os.environ["ARIA2_CONNECTIONS"] = "8"
 os.environ["ARIA2_SPLITS"] = "8"
 os.environ["ARIA2_CHUNK_SIZE"] = "1M"
 ```
+
+
+## Stable bugfix version
+
+This build keeps the fixes proven during testing:
+
+- `download_from_url()` exists and uses `aria2c` when available.
+- Stream URL downloads support resume through aria2 `.aria2` metadata.
+- Background job endpoints are included:
+  - `POST /job/start-progressive`
+  - `GET /job/status/{job_id}`
+- Upload progress is printed for HLS folders, useful for hundreds of `.ts` files.
+- Recovery endpoint added:
+  - `POST /job/upload-existing-hls`
+- Local recovery status endpoint added:
+  - `GET /job/local-files/{job_id}`
+
+Colab install should include:
+
+```python
+!apt-get install -y ffmpeg aria2 > /dev/null
+```
+
+Recommended after cloning in Colab:
+
+```python
+!grep -n "aria2c" colab_worker.py
+!grep -n "start-progressive" colab_worker.py
+!grep -n "job/status" colab_worker.py
+!grep -n "upload-existing-hls" colab_worker.py
+```
