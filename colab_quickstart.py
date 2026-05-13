@@ -1,1 +1,2 @@
-# See README.md for the 2-cell Colab start.
+# Paste these commands into Colab cells, then add your own secrets.
+# Do not commit secrets to GitHub.

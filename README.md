@@ -1,37 +1,66 @@
-# Colab OneDrive HLS Worker UI
+# Colab OneDrive HLS Worker UI - Background Job Version
 
-## Features
+This worker runs in Google Colab and exposes a web UI through Cloudflare Tunnel.
 
-```text
-1. Browse OneDrive files/folders and click Make HLS
-2. Paste stream/video URL and click Make HLS
-3. Select output OneDrive folder path
-4. Progressive HLS:
-   pre_master.m3u8 while running
-   master.m3u8 after finished
-5. Nginx target placeholder for later PC backend upload
-```
+## Main flow
 
-## Push/update to GitHub
+Source video from OneDrive or a direct URL goes to Colab, FFmpeg converts it to HLS, and HLS files are uploaded to OneDrive.
 
-Use `push_to_github.bat` from this bundle, or manually copy these files into your repo:
+## New in this version
+
+Large jobs now run in the background.
+
+Old behavior:
 
 ```text
-colab_worker.py
-requirements.txt
-README.md
-colab_quickstart.py
+Browser request stays open -> download/transcode/upload -> response after finished
 ```
 
-Repo:
+New behavior:
 
 ```text
-https://github.com/chayyakhmer/colab-onedrive-hls-worker.git
+Click Make HLS -> API returns job_id immediately -> job continues in background -> UI polls status
 ```
 
-## Colab Cell 1 — setup + run all in background
+This is better for 4 GB, 10 GB, and 20 GB files because the job is not cancelled just because the browser request disconnects.
 
-Replace secrets before running.
+## Endpoints
+
+```text
+GET  /health
+GET  /debug-env
+GET  /api/onedrive/list?path=/
+POST /job/start-progressive
+GET  /job/status/{job_id}
+POST /job/cancel/{job_id}
+POST /job/transcode-hls-progressive   # old synchronous endpoint, kept for compatibility
+```
+
+## UI features
+
+- Browse OneDrive files
+- Start OneDrive file -> HLS
+- Start URL -> HLS
+- Background job mode
+- Poll progress every 5 seconds
+- Show input GB, output GB, segment count, upload count, pre_master, master playlist path
+- Check current job manually
+- Cancel current FFmpeg job
+
+## Required environment variables
+
+```python
+import os
+os.environ["MS_CLIENT_ID"] = "YOUR_CLIENT_ID"
+os.environ["MS_CLIENT_SECRET"] = "YOUR_CLIENT_SECRET"
+os.environ["MS_TENANT"] = "consumers"
+os.environ["MS_REFRESH_TOKEN"] = "YOUR_REFRESH_TOKEN"
+os.environ["PORT"] = "2323"
+```
+
+Do not commit secrets to GitHub.
+
+## Colab quick start
 
 ```python
 !rm -rf colab-onedrive-hls-worker
@@ -43,14 +72,11 @@ Replace secrets before running.
 !apt-get install -y ffmpeg > /dev/null
 
 import os
-
-os.environ["MS_CLIENT_ID"] = "YOUR_FULL_CLIENT_ID"
+os.environ["MS_CLIENT_ID"] = "YOUR_CLIENT_ID"
 os.environ["MS_CLIENT_SECRET"] = "YOUR_CLIENT_SECRET"
 os.environ["MS_TENANT"] = "consumers"
 os.environ["MS_REFRESH_TOKEN"] = "YOUR_REFRESH_TOKEN"
 os.environ["PORT"] = "2323"
-
-!nvidia-smi || true
 
 !pkill -f colab_worker || true
 !pkill -f cloudflared || true
@@ -59,57 +85,13 @@ os.environ["PORT"] = "2323"
 
 !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
 !chmod +x cloudflared
-
 !nohup ./cloudflared tunnel --no-autoupdate run --token "YOUR_CLOUDFLARE_TUNNEL_TOKEN" > cloudflared.log 2>&1 &
 
 !sleep 8
-
-print("===== LOCAL HEALTH =====")
-!curl -s http://127.0.0.1:2323/health || true
-
-print("\n===== DEBUG ENV =====")
-!curl -s http://127.0.0.1:2323/debug-env || true
-
-print("\n===== WORKER LOG =====")
-!tail -n 30 worker.log
-
-print("\n===== CLOUDFLARED LOG =====")
-!tail -n 50 cloudflared.log
-```
-
-## Colab Cell 2 — test/logs
-
-```python
-print("===== LOCAL HEALTH =====")
 !curl -s http://127.0.0.1:2323/health
-
-print("\n===== PUBLIC HEALTH =====")
 !curl -s https://transcode.labhome.xyz/health || true
-
-print("\n===== LOGS =====")
-!tail -n 80 worker.log
-!tail -n 50 cloudflared.log
 ```
 
-## Open frontend
+## Notes
 
-```text
-https://transcode.labhome.xyz
-```
-
-## Windows DNS workaround
-
-```bat
-curl -v --resolve transcode.labhome.xyz:443:104.21.17.142 https://transcode.labhome.xyz/health
-```
-
-## API endpoints
-
-```text
-GET  /
-GET  /api/onedrive/list?path=/
-POST /api/onedrive/create-folder
-POST /job/transcode-hls-progressive
-GET  /health
-GET  /debug-env
-```
+For unfinished jobs, `pre_master.m3u8` is uploaded progressively. `master.m3u8` is uploaded only after FFmpeg completes successfully.

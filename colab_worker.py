@@ -1,6 +1,6 @@
-import os, time, shutil, subprocess
+import os, time, shutil, subprocess, threading, traceback
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from urllib.parse import quote
 
 import requests
@@ -19,6 +19,43 @@ MS_REFRESH_TOKEN = os.getenv("MS_REFRESH_TOKEN", "").strip()
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 app = FastAPI(title="Colab OneDrive HLS Worker")
+
+
+# In-memory background job registry. Good for Colab sessions.
+# Restarting the notebook clears this registry, but files remain under WORK_DIR.
+JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS_LOCK = threading.Lock()
+
+def now_ts() -> float:
+    return time.time()
+
+def set_job(job_id: str, **updates):
+    with JOBS_LOCK:
+        rec = JOBS.setdefault(job_id, {})
+        rec.update(updates)
+        rec["updated_at"] = now_ts()
+        return dict(rec)
+
+def get_job(job_id: str) -> Dict[str, Any]:
+    with JOBS_LOCK:
+        return dict(JOBS.get(job_id, {}))
+
+def path_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for f in path.rglob("*"):
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+            except FileNotFoundError:
+                pass
+    return total
+
+def count_segments(path: Path) -> int:
+    return len(list(path.glob("seg_*.ts"))) if path.exists() else 0
 
 class HlsJob(BaseModel):
     job_id: str
@@ -99,6 +136,25 @@ def download_url_to_file(url: str, dest: Path, headers: Optional[dict] = None) -
                     f.write(chunk)
                     total += len(chunk)
         return total
+
+
+def download_from_url(url: str, dest: Path) -> int:
+    """
+    Download a direct video/stream URL into Colab local disk.
+    Used by Stream URL -> HLS feature.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    headers = {"User-Agent": "Mozilla/5.0 Colab-HLS-Worker"}
+    with requests.get(url, headers=headers, stream=True, timeout=120) as r:
+        if not r.ok:
+            raise HTTPException(status_code=500, detail=f"URL download failed: {r.status_code} {r.text[:500]}")
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    total += len(chunk)
+    return total
 
 def download_from_onedrive_path(token: str, source_path: str, dest: Path) -> int:
     url = f"{GRAPH_BASE}/me/drive/root:{graph_path(source_path)}:/content"
@@ -284,6 +340,7 @@ def upload_progressive_while_ffmpeg_runs(
     upload_poll_sec: float,
     pre_master_upload_every_sec: float,
     stable_checks: int,
+    job_id: Optional[str] = None,
 ):
     """
     Poll output folder while FFmpeg runs.
@@ -297,6 +354,8 @@ def upload_progressive_while_ffmpeg_runs(
     previous_sizes = {}
     last_pre_upload = 0.0
     temp_pre = output_folder / "_upload_pre_master.m3u8"
+    if job_id:
+        set_job(job_id, status="transcoding", ffmpeg_pid=proc.pid, segments_uploaded=0)
 
     def upload_pre_master(final: bool = False):
         remote_pre = normalize_path(remote_folder).rstrip("/") + "/pre_master.m3u8"
@@ -321,11 +380,15 @@ def upload_progressive_while_ffmpeg_runs(
                 remote_seg = normalize_path(remote_folder).rstrip("/") + "/" + seg.name
                 upload_file(token, seg, remote_seg)
                 uploaded_segments.add(str(seg))
+                if job_id:
+                    set_job(job_id, status="transcoding", segments_created=count_segments(output_folder), segments_uploaded=len(uploaded_segments), output_bytes=path_size_bytes(output_folder))
 
         now = time.time()
         if now - last_pre_upload >= pre_master_upload_every_sec:
             upload_pre_master(final=False)
             last_pre_upload = now
+            if job_id:
+                set_job(job_id, status="transcoding", segments_created=count_segments(output_folder), segments_uploaded=len(uploaded_segments), output_bytes=path_size_bytes(output_folder))
 
         time.sleep(upload_poll_sec)
 
@@ -350,22 +413,20 @@ def upload_progressive_while_ffmpeg_runs(
     # Upload final playlists last.
     upload_pre_master(final=True)
 
+    if job_id:
+        set_job(job_id, status="finalizing", segments_created=count_segments(output_folder), segments_uploaded=len(uploaded_segments), output_bytes=path_size_bytes(output_folder))
+
     return {
         "uploaded_segments": len(uploaded_segments),
         "stderr_tail": (stderr or "")[-1000:],
     }
 
 
-@app.post("/job/transcode-hls-progressive")
-def transcode_hls_progressive(job: ProgressiveHlsJob):
+
+def run_progressive_job_core(job: ProgressiveHlsJob, background: bool = False):
     """
-    Progressive HLS mode:
-    OneDrive/source URL -> full download -> FFmpeg HLS.
-    While FFmpeg runs:
-      - uploads finished seg_XXXXX.ts files
-      - repeatedly uploads pre_master.m3u8
-    After FFmpeg completes:
-      - uploads final master.m3u8
+    Shared progressive HLS implementation.
+    background=True updates JOBS so UI can poll status.
     """
     started = time.time()
     token = get_access_token()
@@ -382,12 +443,31 @@ def transcode_hls_progressive(job: ProgressiveHlsJob):
         ext = "." + job.source_path.split(".")[-1].split("?")[0]
     input_file = job_input_dir / f"source{ext}"
 
+    if background:
+        set_job(
+            job.job_id,
+            status="downloading",
+            started_at=started,
+            source_path=job.source_path,
+            has_download_url=bool(job.download_url),
+            input_file=str(input_file),
+            output_dir=str(job_output_dir),
+            output_onedrive_folder=job.output_onedrive_folder,
+            pre_master_m3u8=normalize_path(job.output_onedrive_folder).rstrip("/") + "/pre_master.m3u8",
+            master_m3u8=normalize_path(job.output_onedrive_folder).rstrip("/") + "/master.m3u8",
+            gpu=has_nvidia_gpu(),
+            error=None,
+        )
+
     if job.download_url:
         bytes_downloaded = download_from_url(job.download_url, input_file)
     elif job.source_path:
         bytes_downloaded = download_from_onedrive_path(token, job.source_path, input_file)
     else:
         raise HTTPException(status_code=400, detail="source_path or download_url required")
+
+    if background:
+        set_job(job.job_id, status="starting_ffmpeg", bytes_downloaded=bytes_downloaded, input_bytes=input_file.stat().st_size)
 
     proc, playlist, encoder, cmd = run_ffmpeg_hls_popen(
         input_file=input_file,
@@ -396,6 +476,9 @@ def transcode_hls_progressive(job: ProgressiveHlsJob):
         audio_bitrate=job.audio_bitrate,
         hls_time=job.hls_time,
     )
+
+    if background:
+        set_job(job.job_id, status="transcoding", encoder=encoder, ffmpeg_pid=proc.pid, ffmpeg_cmd=" ".join(cmd))
 
     upload_result = upload_progressive_while_ffmpeg_runs(
         token=token,
@@ -406,16 +489,13 @@ def transcode_hls_progressive(job: ProgressiveHlsJob):
         upload_poll_sec=job.upload_poll_sec,
         pre_master_upload_every_sec=job.pre_master_upload_every_sec,
         stable_checks=job.stable_checks,
+        job_id=job.job_id if background else None,
     )
 
     if job.delete_original_after_success and job.source_path:
         delete_onedrive_file(token, job.source_path)
 
-    if job.delete_temp_after:
-        shutil.rmtree(job_input_dir, ignore_errors=True)
-        shutil.rmtree(job_output_dir, ignore_errors=True)
-
-    return {
+    result = {
         "ok": True,
         "mode": "progressive",
         "job_id": job.job_id,
@@ -427,6 +507,105 @@ def transcode_hls_progressive(job: ProgressiveHlsJob):
         "master_m3u8": normalize_path(job.output_onedrive_folder).rstrip("/") + "/master.m3u8",
         "elapsed_sec": round(time.time() - started, 2),
     }
+
+    if job.delete_temp_after:
+        shutil.rmtree(job_input_dir, ignore_errors=True)
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+
+    if background:
+        set_job(job.job_id, status="done", finished_at=now_ts(), result=result, ffmpeg_pid=None)
+
+    return result
+
+
+def background_progressive_runner(job_data: dict):
+    job = ProgressiveHlsJob(**job_data)
+    try:
+        run_progressive_job_core(job, background=True)
+    except Exception as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        set_job(
+            job.job_id,
+            status="error",
+            error=detail,
+            traceback=traceback.format_exc()[-4000:],
+            finished_at=now_ts(),
+            ffmpeg_pid=None,
+        )
+
+
+@app.post("/job/start-progressive")
+def start_progressive_background(job: ProgressiveHlsJob):
+    if not job.source_path and not job.download_url:
+        raise HTTPException(status_code=400, detail="source_path or download_url required")
+
+    existing = get_job(job.job_id)
+    if existing.get("status") in {"queued", "downloading", "starting_ffmpeg", "transcoding", "finalizing"}:
+        raise HTTPException(status_code=409, detail=f"Job already running: {job.job_id}")
+
+    set_job(
+        job.job_id,
+        status="queued",
+        started_at=now_ts(),
+        output_onedrive_folder=job.output_onedrive_folder,
+        source_path=job.source_path,
+        has_download_url=bool(job.download_url),
+        gpu=has_nvidia_gpu(),
+        error=None,
+    )
+    t = threading.Thread(target=background_progressive_runner, args=(job.dict(),), daemon=True)
+    t.start()
+    set_job(job.job_id, thread_alive=True)
+    return {
+        "ok": True,
+        "background": True,
+        "job_id": job.job_id,
+        "status_url": f"/job/status/{job.job_id}",
+        "message": "Job started in background. Browser can disconnect; poll status_url.",
+    }
+
+
+@app.get("/job/status/{job_id}")
+def job_status(job_id: str):
+    rec = get_job(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="job not found in current Colab session")
+
+    input_file = Path(rec.get("input_file", "")) if rec.get("input_file") else INPUT_DIR / job_id / "source.mp4"
+    output_dir = Path(rec.get("output_dir", "")) if rec.get("output_dir") else OUTPUT_DIR / job_id
+    rec["input_bytes"] = path_size_bytes(input_file)
+    rec["input_gb"] = round(rec["input_bytes"] / 1024 / 1024 / 1024, 3)
+    rec["output_bytes"] = path_size_bytes(output_dir)
+    rec["output_gb"] = round(rec["output_bytes"] / 1024 / 1024 / 1024, 3)
+    rec["segments_created"] = count_segments(output_dir)
+    rec["pre_master_exists"] = (output_dir / "pre_master.m3u8").exists()
+    rec["master_local_exists"] = (output_dir / "master.m3u8").exists()
+    rec["running"] = rec.get("status") in {"queued", "downloading", "starting_ffmpeg", "transcoding", "finalizing"}
+    return rec
+
+
+@app.post("/job/cancel/{job_id}")
+def cancel_job(job_id: str):
+    rec = get_job(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="job not found")
+    pid = rec.get("ffmpeg_pid")
+    if pid:
+        try:
+            subprocess.run(["kill", "-9", str(pid)], check=False)
+        except Exception:
+            pass
+    set_job(job_id, status="cancelled", finished_at=now_ts(), ffmpeg_pid=None)
+    return {"ok": True, "job_id": job_id, "status": "cancelled"}
+
+
+@app.post("/job/transcode-hls-progressive")
+def transcode_hls_progressive(job: ProgressiveHlsJob):
+    """
+    Old synchronous endpoint. Kept for compatibility.
+    For large files, use /job/start-progressive so browser disconnects do not cancel the job.
+    """
+    return run_progressive_job_core(job, background=False)
 
 
 
@@ -530,6 +709,8 @@ UI_HTML = r"""
     <div class="row">
       <button class="secondary" onclick="health()">Health</button>
       <button class="secondary" onclick="debugEnv()">Debug Env</button>
+      <button class="secondary" onclick="checkCurrentJob()">Check Job</button>
+      <button class="danger" onclick="cancelCurrentJob()">Cancel Job</button>
       <button class="danger" onclick="clearLog()">Clear</button>
     </div>
     <pre id="log">Ready.</pre>
@@ -616,23 +797,79 @@ function goUp() {
   if (document.getElementById('browsePath').value === '') document.getElementById('browsePath').value = '/';
   listOneDrive();
 }
+let currentJobId = null;
+let statusTimer = null;
+
+function shortJobView(s) {
+  return {
+    job_id: s.job_id || currentJobId,
+    status: s.status,
+    gpu: s.gpu,
+    input_gb: s.input_gb,
+    output_gb: s.output_gb,
+    segments_created: s.segments_created,
+    segments_uploaded: s.segments_uploaded,
+    pre_master_exists: s.pre_master_exists,
+    master_local_exists: s.master_local_exists,
+    pre_master_m3u8: s.pre_master_m3u8,
+    master_m3u8: s.master_m3u8,
+    error: s.error || null
+  };
+}
+
+async function startBackgroundJob(payload, label) {
+  currentJobId = payload.job_id;
+  document.getElementById('jobId').value = currentJobId;
+  log({ start: label, mode: 'background', payload });
+  try {
+    const data = await api('/job/start-progressive', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    log(data);
+    startPolling(currentJobId);
+  } catch(e) { log(e); }
+}
+
+function startPolling(jobId) {
+  if (statusTimer) clearInterval(statusTimer);
+  statusTimer = setInterval(async () => {
+    try {
+      const s = await api('/job/status/' + encodeURIComponent(jobId));
+      log(shortJobView(s));
+      if (['done', 'error', 'cancelled'].includes(s.status)) {
+        clearInterval(statusTimer);
+        statusTimer = null;
+      }
+    } catch(e) {
+      log(e);
+      clearInterval(statusTimer);
+      statusTimer = null;
+    }
+  }, 5000);
+}
+
+async function checkCurrentJob() {
+  const jobId = document.getElementById('jobId').value.trim() || currentJobId;
+  if (!jobId) { log('No job ID.'); return; }
+  currentJobId = jobId;
+  try { log(shortJobView(await api('/job/status/' + encodeURIComponent(jobId)))); }
+  catch(e) { log(e); }
+}
+
+async function cancelCurrentJob() {
+  const jobId = document.getElementById('jobId').value.trim() || currentJobId;
+  if (!jobId) { log('No job ID.'); return; }
+  try { log(await api('/job/cancel/' + encodeURIComponent(jobId), { method: 'POST' })); }
+  catch(e) { log(e); }
+}
+
 async function makeHlsFromOneDrive() {
   const payload = buildPayload('onedrive');
   if (!payload.source_path || !payload.output_onedrive_folder) { log('source_path and output folder are required.'); return; }
-  log({ start: 'OneDrive progressive HLS job', payload });
-  try {
-    const data = await api('/job/transcode-hls-progressive', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
-    log(data);
-  } catch(e) { log(e); }
+  startBackgroundJob(payload, 'OneDrive progressive HLS job');
 }
 async function makeHlsFromUrl() {
   const payload = buildPayload('url');
   if (!payload.download_url || !payload.output_onedrive_folder) { log('download_url and output folder are required.'); return; }
-  log({ start: 'URL progressive HLS job', payload });
-  try {
-    const data = await api('/job/transcode-hls-progressive', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
-    log(data);
-  } catch(e) { log(e); }
+  startBackgroundJob(payload, 'URL progressive HLS job');
 }
 health();
 listOneDrive();
